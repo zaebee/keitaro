@@ -14,6 +14,12 @@ import {
   summarizeDraftChanges,
 } from "./allocationSummary";
 import { draftChanges, hasDraftChanges } from "./draftChanges";
+import {
+  computeActionMenuPlacement,
+  describeOfferStatus,
+  describeShareEditState,
+  type ActionMenuPlacement,
+} from "./offerRowModel";
 import { failureMessage, hintFor, type Failure } from "./useStreamDraft";
 import styles from "./OfferEditorPage.module.css";
 
@@ -553,9 +559,7 @@ export function DraftPanel({
                   ) : (
                     <details className={styles.archivedTray}>
                       <summary className={styles.archivedSummary}>
-                        <span className={styles.archivedChevron} aria-hidden="true">
-                          ⌄
-                        </span>
+                        <ChevronDownIcon className={styles.archivedChevron} />
                         <span>
                           Archived offers in baseline{" "}
                           <span className={styles.archivedCount}>
@@ -688,6 +692,25 @@ function KebabIcon() {
   );
 }
 
+function ChevronDownIcon({ className }: Readonly<{ className?: string }>) {
+  return (
+    <svg
+      aria-hidden="true"
+      className={className}
+      fill="none"
+      height="15"
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="2"
+      viewBox="0 0 24 24"
+      width="15"
+    >
+      <path d="M6 9l6 6 6-6" />
+    </svg>
+  );
+}
+
 type OfferRowProps = Readonly<{
   offer: StagedOfferResponse;
   colorIndex: number;
@@ -711,21 +734,107 @@ function OfferRow({
   onShareInput,
   onShareSubmit,
 }: OfferRowProps) {
-  const shareModified =
-    baselineShare !== undefined && baselineShare !== offer.share;
+  const shareState = describeShareEditState({
+    offerShare: offer.share,
+    baselineShare,
+    draftInput: shareInput,
+  });
+  const statusInfo = describeOfferStatus({
+    lifecycle: offer.lifecycle,
+    remoteState: offer.state,
+  });
+
   const [menuOpen, setMenuOpen] = useState(false);
-  const closeMenu = () => setMenuOpen(false);
+  const [menuPlacement, setMenuPlacement] = useState<ActionMenuPlacement>({
+    mode: "absolute",
+  });
+  const menuContainerRef = useRef<HTMLDivElement>(null);
+  const kebabButtonRef = useRef<HTMLButtonElement>(null);
+
+  const closeMenu = (restoreFocus = false) => {
+    setMenuOpen(false);
+    if (restoreFocus) {
+      kebabButtonRef.current?.focus();
+    }
+  };
+
+  useEffect(() => {
+    if (!menuOpen) {
+      return undefined;
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (target && !menuContainerRef.current?.contains(target)) {
+        setMenuOpen(false);
+      }
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMenuOpen(false);
+        kebabButtonRef.current?.focus();
+      }
+    };
+
+    const handleViewportChange = () => {
+      setMenuOpen(false);
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", handleViewportChange);
+    window.addEventListener("scroll", handleViewportChange, true);
+
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", handleViewportChange);
+      window.removeEventListener("scroll", handleViewportChange, true);
+    };
+  }, [menuOpen]);
+
+  const toggleMenu = () => {
+    if (menuOpen) {
+      setMenuOpen(false);
+      return;
+    }
+    const rect = kebabButtonRef.current?.getBoundingClientRect() ?? null;
+    setMenuPlacement(
+      computeActionMenuPlacement(rect, {
+        width: window.innerWidth,
+        height: window.innerHeight,
+      }),
+    );
+    setMenuOpen(true);
+  };
+
   const runAction = (kind: "remove" | "restore" | "pin" | "unpin") => {
-    closeMenu();
+    closeMenu(false);
     onAction({ kind, offerId: offer.offer_id });
   };
+
   const focusShareInput = () => {
-    const el = document.getElementById(`share-${offer.offer_id}`) as HTMLInputElement | null;
+    const el = document.getElementById(
+      `share-${offer.offer_id}`,
+    ) as HTMLInputElement | null;
     if (el) {
       el.focus();
       el.select();
     }
   };
+
+  const floatingMenuStyle =
+    menuPlacement.mode === "fixed"
+      ? {
+          position: "fixed" as const,
+          top: menuPlacement.top,
+          bottom: menuPlacement.bottom,
+          right: menuPlacement.right,
+          zIndex: 60,
+        }
+      : undefined;
 
   return (
     <tr className={offer.lifecycle === "ARCHIVED" ? styles.offerArchived : ""}>
@@ -733,27 +842,48 @@ function OfferRow({
         <OfferThumbnail index={colorIndex} />
         <div className={styles.offerIdentityText}>
           <span className={styles.offerTitleRow}>
-            <span className={styles.offerIdValue}>Offer #{offer.offer_id}</span>
-            {shareModified && (
+            <span className={`${styles.offerIdValue} tnum`}>
+              Offer #{offer.offer_id}
+            </span>
+            {shareState.shareModified && (
               <span
-                className={styles.modifiedDot}
-                title="Share modified in draft"
-              />
+                className={styles.modifiedPill}
+                title="Share modified in local draft"
+              >
+                <span className={styles.modifiedDot} aria-hidden="true" />
+                Modified
+              </span>
             )}
           </span>
-          <span className={`${styles.offerSubId} tnum`}>#{offer.offer_id}</span>
         </div>
       </th>
       <td className={styles.offerShareCell}>
         <div className={styles.shareCellRow}>
-          <span className={`${styles.shareBadgeText} tnum`}>
-            {shareModified ? (
+          <span
+            className={`${styles.shareBadgeText} tnum`}
+            title={
+              shareState.shareModified
+                ? `Baseline: ${shareState.baselinePercentLabel} → Draft: ${shareState.currentPercentLabel}`
+                : `Current share: ${shareState.currentPercentLabel}`
+            }
+          >
+            {shareState.shareModified ? (
               <>
-                <s>{baselineShare}</s>{" "}
-                <span className={styles.shareArrow}>→</span> {offer.share}
+                <s>{baselineShare}</s>
+                <span aria-hidden="true">%</span>{" "}
+                <span className={styles.shareArrow}>→</span>{" "}
+                <strong className={styles.shareCurrentValue}>
+                  {offer.share}
+                </strong>
+                <span className={styles.shareCurrentUnit}>%</span>
               </>
             ) : (
-              offer.share
+              <>
+                <strong className={styles.shareCurrentValue}>
+                  {offer.share}
+                </strong>
+                <span className={styles.shareCurrentUnit}>%</span>
+              </>
             )}
           </span>
           {offer.lifecycle === "ACTIVE" && (
@@ -765,12 +895,18 @@ function OfferRow({
                 onShareSubmit(offer.offer_id);
               }}
             >
-              <span className={styles.shareInputWrap}>
+              <span
+                className={`${styles.shareInputWrap} ${
+                  shareState.inputDiffersFromCurrent
+                    ? styles.shareInputWrapDirty
+                    : ""
+                }`}
+              >
                 <input
                   id={`share-${offer.offer_id}`}
                   type="text"
                   inputMode="numeric"
-                  aria-label="Share 0–100"
+                  aria-label={`Share for offer ${offer.offer_id}, 0 to 100%`}
                   placeholder={String(offer.share)}
                   value={shareInput}
                   onChange={(event) =>
@@ -789,8 +925,11 @@ function OfferRow({
               <button
                 type="submit"
                 className={`${styles.setShareBtn} ${
-                  shareInput.trim() !== "" ? styles.setShareBtnReady : ""
+                  shareState.inputDiffersFromCurrent
+                    ? styles.setShareBtnReady
+                    : ""
                 }`}
+                title={shareState.submitTitle}
                 disabled={disabled}
               >
                 Set share
@@ -814,6 +953,7 @@ function OfferRow({
             className={`${styles.allocationModeBtn} ${
               offer.is_pinned ? styles.allocationPinned : styles.allocationAuto
             }`}
+            aria-pressed={offer.is_pinned}
             disabled={disabled}
             onClick={() =>
               onAction({
@@ -823,8 +963,8 @@ function OfferRow({
             }
             title={
               offer.is_pinned
-                ? "Click to unlock and allow automatic balancing"
-                : "Click to pin current share"
+                ? `Pinned at ${offer.share}% — click to unlock for automatic balancing`
+                : `Auto-balanced (${offer.share}%) — click to pin share`
             }
           >
             {offer.is_pinned ? <LockIcon /> : <AutoIcon />}
@@ -848,15 +988,17 @@ function OfferRow({
             aria-hidden="true"
           />
           <span className={styles.statusPrimaryText}>
-            {offer.lifecycle === "ACTIVE" ? "Active" : "Archived"}
+            {statusInfo.primaryLabel}
           </span>
-          {offer.state && offer.state !== "active" && (
-            <span className={styles.offerLifecycle}>({offer.state})</span>
+          {statusInfo.remoteBadgeLabel && (
+            <span className={styles.offerRemoteBadge}>
+              {statusInfo.remoteBadgeLabel}
+            </span>
           )}
         </span>
       </td>
       <td>
-        <div className={styles.inlineActions}>
+        <div className={styles.inlineActions} ref={menuContainerRef}>
           {offer.lifecycle === "ACTIVE" && (
             <button
               type="button"
@@ -864,28 +1006,42 @@ function OfferRow({
               disabled={disabled}
               aria-label={`Edit share for offer ${offer.offer_id}`}
               onClick={focusShareInput}
-              title="Edit share"
+              title="Focus share input"
             >
               <PencilIcon />
             </button>
           )}
           <button
+            ref={kebabButtonRef}
             type="button"
             className={styles.kebabButton}
             disabled={disabled}
             aria-label={`More actions for offer ${offer.offer_id}`}
             aria-expanded={menuOpen}
-            onClick={() => setMenuOpen((open) => !open)}
+            aria-haspopup="true"
+            onClick={toggleMenu}
+            title="More actions"
           >
             <KebabIcon />
           </button>
           {menuOpen && (
-            <div className={styles.actionMenu}>
+            <div className={styles.actionMenu} style={floatingMenuStyle}>
+              <button
+                type="button"
+                disabled={disabled}
+                aria-label={`${offer.is_pinned ? "Unpin" : "Pin"} offer ${offer.offer_id}`}
+                onClick={() => runAction(offer.is_pinned ? "unpin" : "pin")}
+              >
+                {offer.is_pinned ? "Unpin offer" : "Pin offer"}
+              </button>
+              <div className={styles.menuDivider} role="separator" />
               {offer.lifecycle === "ACTIVE" ? (
                 <button
                   type="button"
+                  className={styles.actionMenuDanger}
                   disabled={disabled}
                   aria-label={`Remove offer ${offer.offer_id}`}
+                  title="Moves offer to Archived in local draft (does not delete in Keitaro yet)"
                   onClick={() => runAction("remove")}
                 >
                   Remove offer
@@ -900,14 +1056,6 @@ function OfferRow({
                   Restore offer
                 </button>
               )}
-              <button
-                type="button"
-                disabled={disabled}
-                aria-label={`${offer.is_pinned ? "Unpin" : "Pin"} offer ${offer.offer_id}`}
-                onClick={() => runAction(offer.is_pinned ? "unpin" : "pin")}
-              >
-                {offer.is_pinned ? "Unpin offer" : "Pin offer"}
-              </button>
             </div>
           )}
         </div>

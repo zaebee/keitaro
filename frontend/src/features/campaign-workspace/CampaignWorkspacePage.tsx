@@ -106,7 +106,18 @@ function StreamToggle({
         className={`${styles.streamChevron} ${open ? styles.streamChevronOpen : ""}`}
         aria-hidden="true"
       >
-        ▾
+        <svg
+          fill="none"
+          height="16"
+          stroke="currentColor"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth="2"
+          viewBox="0 0 24 24"
+          width="16"
+        >
+          <path d="M6 9l6 6 6-6" />
+        </svg>
       </span>
     </button>
   );
