@@ -1,0 +1,5 @@
+{
+  "name": "Keitaro Wrap",
+  "description": "Campaign creator and offer share allocation editor wrapping the Keitaro Admin API with durable operations, fetch reconciliation, staged drafts, and publication recovery.",
+  "requestFramePermissions": []
+}

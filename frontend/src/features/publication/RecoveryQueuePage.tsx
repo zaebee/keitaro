@@ -1,0 +1,904 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useRef, useState } from "react";
+import { Link } from "react-router-dom";
+
+import { ApiError } from "../../api/client";
+import {
+  cancelPublication,
+  getDraftState,
+  getPublicationState,
+  getRecoverablePublications,
+  RECOVERABLE_PUBLICATIONS_LIMIT,
+  runRecoveryPass,
+  type DraftStateResponse,
+  type PublicPublicationResponse,
+  type PublicationStateResponse,
+  type PublicationStatus,
+  type RecoveryResultResponse,
+} from "../../api/operations";
+import { queryKeys } from "../../queries/queryClient";
+import { useFocusOnChange } from "../../shared/hooks/useFocusOnChange";
+import { useNarrowViewport } from "../../shared/hooks/useNarrowViewport";
+import { PublicationOperationCard } from "./PublicationOperationCard";
+import { PublicationReadError } from "./PublicationStatusPanel";
+import {
+  hasMatchingStreamIdentity,
+  identitiesFromQueue,
+  isTerminalPublicationState,
+  isValidDraftState,
+  isValidPublicationState,
+  mergeStreamIdentities,
+  parseCancelErrorDetails,
+  parseCancelResult,
+  parseRecoverableQueue,
+  parseRecoveryResult,
+  streamUnionFingerprint,
+  type StreamIdentity,
+} from "./publicationValidation";
+import {
+  verifyCancelLock,
+  type CancelVerificationMode,
+  type VerificationResult,
+} from "./publicationLockVerification";
+import styles from "./Publication.module.css";
+import {
+  lockSnapshot,
+  usePublicationRecoveryLock,
+  type LockContext,
+  type LockSnapshot,
+  type PublicationLockApi,
+} from "./usePublicationRecoveryLock";
+
+type Failure = {
+  message: string;
+  code: string | null;
+  result: RecoveryResultResponse | null;
+};
+
+type RecoveryRunOutcome = {
+  result: RecoveryResultResponse | null;
+  failure: Failure | null;
+  unionUpdated: boolean;
+  phaseUpdated: boolean;
+};
+
+function snapshotsEqual(
+  left: LockSnapshot,
+  right: LockSnapshot,
+): boolean {
+  return (
+    left.lockId === right.lockId &&
+    left.kind === right.kind &&
+    left.stage === right.stage &&
+    left.unionFingerprint === right.unionFingerprint &&
+    left.draftFingerprint === right.draftFingerprint &&
+    left.cancelTargetFingerprint === right.cancelTargetFingerprint
+  );
+}
+
+const RECOVERY_VERIFIED_MESSAGE =
+  "No unresolved operations in the current bounded read; previously tracked stream identities re-read successfully.";
+
+function reportVerification(
+  result: VerificationResult,
+  setError: (message: string) => void,
+  setMessage: (message: string) => void,
+): void {
+  if (result.status === "blocked") {
+    setError(result.message);
+  } else {
+    setMessage(result.message);
+  }
+}
+
+async function verifyRecoveryOrigin(
+  context: LockContext,
+): Promise<VerificationResult> {
+  const queue = await getRecoverablePublications();
+  const parsed = parseRecoverableQueue(queue);
+  if (parsed === null) {
+    return { status: "blocked", message: "The bounded queue response was malformed. The lock remains active." };
+  }
+  const merged = await context.updateAffected(
+    identitiesFromQueue(parsed),
+    parsed.length < RECOVERABLE_PUBLICATIONS_LIMIT,
+  );
+  if (!merged) {
+    return { status: "blocked", message: "Could not persist the affected identity union. The lock remains active." };
+  }
+  if (parsed.length >= RECOVERABLE_PUBLICATIONS_LIMIT) {
+    return { status: "blocked", message: "The current queue read is potentially truncated. The lock remains active." };
+  }
+  if (parsed.length > 0) {
+    return {
+      status: "blocked",
+      message: `${parsed.length} unresolved operation(s) remain in the complete bounded read. The lock remains active.`,
+    };
+  }
+  const current = context.getCurrent();
+  if (current === null) {
+    return { status: "blocked", message: "The persisted lock state is unavailable. The lock remains active." };
+  }
+  if (!current.unionComplete) {
+    return { status: "blocked", message: "The affected identity union is incomplete. The lock remains active." };
+  }
+  const checks = await Promise.all(
+    current.affected.map(async (identity: StreamIdentity) => {
+      try {
+        return isTerminalPublicationState(
+          await getPublicationState(identity.campaignId, identity.streamRef),
+          identity,
+        );
+      } catch {
+        return false;
+      }
+    }),
+  );
+  if (!checks.every(Boolean)) {
+    return { status: "blocked", message: "One or more tracked stream states could not be validated. The lock remains active." };
+  }
+  const released = await context.release({
+    lockId: current.lockId,
+    fingerprint: streamUnionFingerprint(current.affected),
+  });
+  if (!released) {
+    return { status: "blocked", message: "The persisted lock changed during verification. The lock remains active." };
+  }
+  return { status: "released", message: RECOVERY_VERIFIED_MESSAGE };
+}
+
+async function startHandoffRecovery(
+  lock: PublicationLockApi,
+  expected: LockSnapshot,
+  queue: PublicPublicationResponse[],
+): Promise<boolean> {
+  if (expected?.kind !== "cancel" || expected?.stage !== "recovery_ready") {
+    return false;
+  }
+  return await lock.runExclusive(async (context) => {
+    const observed = context.getCurrent();
+    if (observed === null || !snapshotsEqual(lockSnapshot(observed), expected)) {
+      return false;
+    }
+    const incoming = identitiesFromQueue(queue);
+    const updated = await context.updateAffected(
+      incoming,
+      queue.length < RECOVERABLE_PUBLICATIONS_LIMIT,
+    );
+    if (!updated) {
+      return false;
+    }
+    const merged = mergeStreamIdentities(observed.affected, incoming);
+    return await context.markStage("running", {
+      ...expected,
+      unionFingerprint: streamUnionFingerprint(merged.identities),
+    });
+  });
+}
+
+function publishBannerText(lock: PublicationLockApi["lock"]): string {
+  if (lock === null) {
+    return "";
+  }
+  if (lock.kind === "cancel" && lock.stage === "recovery_ready") {
+    return " Recovery is required; the cancel lock was handed to explicit recovery.";
+  }
+  if (lock.kind === "cancel" && lock.stage === "retry_ready") {
+    return " The publication is still pending; an explicit cancel retry is required.";
+  }
+  if (lock.stage === "running") {
+    return " A mutation is in flight; GET reconciliation is disabled until it finishes.";
+  }
+  if (lock.stage === "reserved") {
+    return " No Cancel POST was sent; GET reconciliation is available.";
+  }
+  return " Read-only actions remain available; further recovery passes are blocked until authoritative GET re-read succeeds.";
+}
+
+type RetryReads = {
+  state: PublicationStateResponse;
+  draft: DraftStateResponse;
+  queue: PublicPublicationResponse[];
+};
+
+async function readRetryPreflight(
+  target: StreamIdentity,
+): Promise<RetryReads | null> {
+  try {
+    const state = await getPublicationState(target.campaignId, target.streamRef);
+    if (!isValidPublicationState(state, target)) {
+      return null;
+    }
+    const draft = await getDraftState(target.campaignId, target.streamRef);
+    if (!isValidDraftState(draft, target)) {
+      return null;
+    }
+    const queue = parseRecoverableQueue(await getRecoverablePublications());
+    return queue === null ? null : { state, draft, queue };
+  } catch {
+    return null;
+  }
+}
+
+async function readUnrelatedStatuses(
+  affected: StreamIdentity[],
+  target: StreamIdentity,
+): Promise<{ identity: StreamIdentity; status: PublicationStatus | null }[] | null> {
+  const identities = affected.filter(
+    (identity) =>
+      identity.campaignId !== target.campaignId ||
+      identity.streamRef !== target.streamRef,
+  );
+  try {
+    return await Promise.all(
+      identities.map(async (identity) => {
+        const state = await getPublicationState(
+          identity.campaignId,
+          identity.streamRef,
+        );
+        if (!isValidPublicationState(state, identity)) {
+          throw new Error("unrelated status mismatch");
+        }
+        return { identity, status: state.operation?.status ?? null };
+      }),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function retryResultMode(result: ReturnType<typeof parseCancelResult>) {
+  if (result === null) {
+    return { mode: "unknown" as CancelVerificationMode };
+  }
+  if (result.status === "abandoned") {
+    return { mode: "success" as CancelVerificationMode };
+  }
+  if (result.reason === "NO_PUBLICATION") {
+    return { mode: "noop" as CancelVerificationMode };
+  }
+  return { mode: "unknown" as CancelVerificationMode };
+}
+
+function retryErrorMode(
+  error: unknown,
+  target: StreamIdentity,
+): { mode: CancelVerificationMode; code?: string } {
+  if (
+    error instanceof ApiError &&
+    error.code === "STREAM_NOT_FOUND" &&
+    hasMatchingStreamIdentity(error.details, target)
+  ) {
+    return { mode: "refusal", code: "STREAM_NOT_FOUND" };
+  }
+  if (error instanceof ApiError && error.status === 409) {
+    if (parseCancelErrorDetails(error.details) !== null) {
+      return { mode: "refusal", code: error.code };
+    }
+  }
+  return { mode: "unknown" };
+}
+
+function describeFailure(error: unknown): Failure {
+  if (error instanceof ApiError) {
+    return {
+      message: error.message,
+      code: error.code,
+      result: parseRecoveryResult(error.details.result),
+    };
+  }
+  return {
+    message: "The API could not be reached. Check the local backend and try again.",
+    code: null,
+    result: null,
+  };
+}
+
+function resultHeading(result: RecoveryResultResponse, degraded: boolean): string {
+  if (degraded) {
+    return "Recovery pass did not complete cleanly";
+  }
+  if (
+    result.remaining > 0 ||
+    result.unresolved > 0 ||
+    result.degraded > 0 ||
+    result.deadline_reached
+  ) {
+    return "Bounded pass finished with unresolved work";
+  }
+  return "Recovery pass completed";
+}
+
+function RecoveryResultSummary({
+  result,
+  degraded,
+}: Readonly<{ result: RecoveryResultResponse; degraded: boolean }>) {
+  return (
+    <div className={styles.recoveryPanel}>
+      <h2>{resultHeading(result, degraded || result.degraded > 0)}</h2>
+      <dl className={styles.counters}>
+        <dt>Processed</dt>
+        <dd>{result.processed}</dd>
+        <dt>Confirmed</dt>
+        <dd>{result.confirmed}</dd>
+        <dt>Unresolved</dt>
+        <dd>{result.unresolved}</dd>
+        <dt>Degraded</dt>
+        <dd>{result.degraded}</dd>
+        <dt>Remaining</dt>
+        <dd>{result.remaining}</dd>
+        <dt>Deadline reached</dt>
+        <dd>{String(result.deadline_reached)}</dd>
+      </dl>
+      <p className={styles.hint}>
+        These counters describe the request and the bounded pass only. They do
+        not prove that all operations are resolved; current state must be
+        re-read.
+      </p>
+    </div>
+  );
+}
+
+export function RecoveryQueuePage() {
+  const narrow = useNarrowViewport();
+  const queryClient = useQueryClient();
+  const queueQuery = useQuery({
+    queryKey: queryKeys.recoverablePublications,
+    queryFn: getRecoverablePublications,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+  const lock = usePublicationRecoveryLock();
+  const [confirming, setConfirming] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const actionErrorRef = useFocusOnChange<HTMLParagraphElement>(actionError);
+  const [verificationError, setVerificationError] = useState<string | null>(null);
+  const verificationErrorRef =
+    useFocusOnChange<HTMLParagraphElement>(verificationError);
+  const [verificationMessage, setVerificationMessage] = useState<string | null>(
+    null,
+  );
+  const [unlockInFlight, setUnlockInFlight] = useState(false);
+  const unlockRef = useRef(false);
+  const [retryInFlight, setRetryInFlight] = useState(false);
+  const [retryMessage, setRetryMessage] = useState<string | null>(null);
+  const [retryError, setRetryError] = useState<string | null>(null);
+
+  const recoveryMutation = useMutation<RecoveryRunOutcome>({
+    mutationFn: async () => {
+      let result: RecoveryResultResponse | null = null;
+      let failure: Failure | null = null;
+      try {
+        const raw = await runRecoveryPass();
+        const parsed = parseRecoveryResult(raw);
+        if (parsed === null) {
+          failure = {
+            message:
+              "The recovery response was malformed. The outcome is unknown.",
+            code: null,
+            result: null,
+          };
+        } else {
+          result = parsed;
+        }
+      } catch (error) {
+        failure = describeFailure(error);
+      }
+
+      let unionUpdated = false;
+      try {
+        const queue = await getRecoverablePublications();
+        const parsed = parseRecoverableQueue(queue);
+        if (parsed !== null) {
+          queryClient.setQueryData(queryKeys.recoverablePublications, parsed);
+          unionUpdated = await lock.updateAffected(
+            identitiesFromQueue(parsed),
+            parsed.length < RECOVERABLE_PUBLICATIONS_LIMIT,
+          );
+        }
+      } catch {
+        unionUpdated = false;
+      }
+
+      const phaseUpdated = await lock.markVerification(unionUpdated);
+      if (!phaseUpdated) {
+        return {
+          result: null,
+          failure: {
+            message:
+              "Could not persist the recovery phase transition. The lock remains in running phase.",
+            code: null,
+            result: null,
+          },
+          unionUpdated,
+          phaseUpdated: false,
+        };
+      }
+      return { result, failure, unionUpdated, phaseUpdated };
+    },
+  });
+
+  const parsedQueue = queueQuery.isSuccess
+    ? parseRecoverableQueue(queueQuery.data)
+    : null;
+  const queueInvalid = queueQuery.isSuccess && parsedQueue === null;
+  const operations = parsedQueue ?? [];
+  const potentiallyTruncated =
+    operations.length >= RECOVERABLE_PUBLICATIONS_LIMIT;
+  const locked = lock.lock !== null || lock.invalid;
+  const recoveryReady =
+    lock.lock?.kind === "cancel" && lock.lock.stage === "recovery_ready";
+  const retryReady =
+    lock.lock?.kind === "cancel" && lock.lock.stage === "retry_ready";
+  const mutationDisabled =
+    (!recoveryReady && locked) ||
+    recoveryMutation.isPending ||
+    queueQuery.isFetching ||
+    parsedQueue === null;
+
+  const confirmRecovery = async () => {
+    setConfirming(false);
+    setActionError(null);
+    setVerificationError(null);
+    setVerificationMessage(null);
+    const startLock = lock.getCurrent();
+    const startSnapshot = startLock === null ? undefined : lockSnapshot(startLock);
+    let freshQueue;
+    try {
+      const response = await getRecoverablePublications();
+      freshQueue = parseRecoverableQueue(response);
+      if (freshQueue === null) {
+        throw new Error("malformed queue");
+      }
+      queryClient.setQueryData(queryKeys.recoverablePublications, freshQueue);
+    } catch {
+      setActionError(
+        "A fresh valid queue snapshot is required before recovery can start.",
+      );
+      return;
+    }
+    if (recoveryReady) {
+      const started =
+        startSnapshot !== undefined &&
+        (await startHandoffRecovery(lock, startSnapshot, freshQueue));
+      if (!started) {
+        setActionError(
+          "The handoff lock changed before Recovery started. No pass was started.",
+        );
+        return;
+      }
+      recoveryMutation.mutate();
+      return;
+    }
+    const acquired = await lock.acquire(
+      identitiesFromQueue(freshQueue),
+      "verification",
+      freshQueue.length < RECOVERABLE_PUBLICATIONS_LIMIT,
+    );
+    if (!acquired) {
+      setActionError(
+        "Could not persist the recovery lock. No recovery pass was started.",
+      );
+      return;
+    }
+    recoveryMutation.mutate();
+  };
+
+  const verifyUnlock = async () => {
+    if (unlockRef.current) {
+      return;
+    }
+    unlockRef.current = true;
+    setUnlockInFlight(true);
+    setVerificationError(null);
+    setVerificationMessage(null);
+    try {
+      await lock.runExclusive(async (context) => {
+        const initial = context.getCurrent();
+        if (initial === null) {
+          setVerificationError(
+            "The persisted lock state is unavailable. The lock remains active.",
+          );
+          return;
+        }
+        if (initial.kind === "cancel") {
+          const target = initial.cancelTarget;
+          if (target === null) {
+            setVerificationError(
+              "No explicit cancel target is available. The lock remains active.",
+            );
+            return;
+          }
+          const mode =
+            initial.stage === "retry_ready" || initial.stage === "reserved"
+              ? "reconcile"
+              : "recovery";
+          const result = await verifyCancelLock(context, {
+            mode,
+            target,
+            onQueue: (queue) => {
+              queryClient.setQueryData(queryKeys.recoverablePublications, queue);
+            },
+          });
+          if (result.status === "released") {
+            setVerificationMessage(
+              "No unresolved operations in the current bounded read; previously tracked stream identities re-read successfully.",
+            );
+          } else if (result.status === "retry") {
+            setVerificationMessage(result.message);
+          } else if (result.status === "handoff") {
+            setVerificationMessage(result.message);
+          } else {
+            setVerificationError(result.message);
+          }
+          return;
+        }
+        if (initial.phase !== "verification") {
+          setVerificationError(
+            "Recovery POST is still running; GET reconciliation is disabled.",
+          );
+          return;
+        }
+        const result = await verifyRecoveryOrigin(context);
+        reportVerification(result, setVerificationError, setVerificationMessage);
+      });
+    } catch {
+      setVerificationError(
+        "Authoritative GET re-read failed. The lock remains active.",
+      );
+    } finally {
+      unlockRef.current = false;
+      setUnlockInFlight(false);
+    }
+  };
+
+  const retryCancel = async () => {
+    if (retryInFlight || !retryReady || lock.lock === null) {
+      return;
+    }
+    setRetryInFlight(true);
+    setRetryError(null);
+    setRetryMessage(null);
+    const current = lock.getCurrent();
+    const target = current?.cancelTarget;
+    if (current === null || target === null || target === undefined) {
+      setRetryError("No explicit cancel target is available for retry.");
+      setRetryInFlight(false);
+      return;
+    }
+    const expected = lockSnapshot(current);
+    const handOff = async (message: string, failure: string) => {
+      const changed = await lock.runExclusive(async (context) =>
+        await context.markStage("recovery_ready", expected),
+      );
+      if (changed) {
+        setRetryMessage(message);
+      } else {
+        setRetryError(failure);
+      }
+    };
+    try {
+      const fresh = await readRetryPreflight(target);
+      if (fresh === null) {
+        setRetryError(
+          "Fresh authoritative status, draft and queue reads are required before retry.",
+        );
+        return;
+      }
+      queryClient.setQueryData(queryKeys.recoverablePublications, fresh.queue);
+      const unrelated = await readUnrelatedStatuses(current.affected, target);
+      if (unrelated === null) {
+        setRetryError(
+          "All affected stream statuses must be re-read before retry. No Cancel was sent.",
+        );
+        return;
+      }
+      const recoveryNeeded = unrelated.find(
+        (entry) =>
+          entry.status === "in_progress" || entry.status === "ambiguous",
+      );
+      if (recoveryNeeded !== undefined) {
+        await handOff(
+          "Unrelated unresolved work requires Recovery. The lock was handed off; no retry Cancel was sent.",
+          "Could not persist the recovery handoff. No retry Cancel was sent.",
+        );
+        return;
+      }
+      if (unrelated.some((entry) => entry.status === "pending")) {
+        setRetryError(
+          "An unrelated affected stream is pending. The retry target is unchanged and no Cancel was sent.",
+        );
+        return;
+      }
+      if (fresh.state.operation?.status !== "pending") {
+        const observed = fresh.state.operation?.status ?? null;
+        if (observed === "in_progress" || observed === "ambiguous") {
+          await handOff(
+            "Recovery is required. The lock was handed to explicit recovery; no retry Cancel was sent.",
+            "Could not persist the recovery handoff. The lock remains active.",
+          );
+          return;
+        }
+        const verification = await lock.runExclusive((context) =>
+          verifyCancelLock(context, {
+            mode: "reconcile",
+            target,
+            expected,
+            onQueue: (queue) => {
+              queryClient.setQueryData(queryKeys.recoverablePublications, queue);
+            },
+          }),
+        );
+        reportVerification(verification, setRetryError, setRetryMessage);
+        return;
+      }
+      const running = await lock.runExclusive(async (context) =>
+        await context.markStage("running", expected),
+      );
+      if (!running) {
+        setRetryError(
+          "The running phase could not be persisted. No retry Cancel was sent.",
+        );
+        return;
+      }
+      let mode: CancelVerificationMode = "unknown";
+      let code: string | undefined;
+      try {
+        mode = retryResultMode(
+          parseCancelResult(
+            await cancelPublication(target.campaignId, target.streamRef),
+            target,
+          ),
+        ).mode;
+      } catch (error) {
+        const classified = retryErrorMode(error, target);
+        mode = classified.mode;
+        code = classified.code;
+      }
+      const verification = await lock.runExclusive((context) =>
+        verifyCancelLock(context, {
+          mode,
+          code,
+          target,
+          preDraftVersion: fresh.draft.draft?.version,
+          onQueue: (queue) => {
+            queryClient.setQueryData(queryKeys.recoverablePublications, queue);
+          },
+        }),
+      );
+      reportVerification(verification, setRetryError, setRetryMessage);
+    } catch {
+      setRetryError("The retry Cancel outcome is unknown. No automatic retry was made.");
+    } finally {
+      setRetryInFlight(false);
+    }
+  };
+
+  const run = recoveryMutation.data;
+
+  return (
+    <section
+      aria-labelledby="recovery-heading"
+      className={`${styles.panel} ${narrow ? styles.narrow : ""}`}
+      aria-busy={
+        queueQuery.isFetching ||
+        recoveryMutation.isPending ||
+        lock.lock !== null
+      }
+      data-recovery-lock={locked ? "active" : "inactive"}
+    >
+      <h1 id="recovery-heading">Recoverable publications</h1>
+      <p>
+        Bounded, point-in-time queue of unresolved publication operations.
+        Reads are always available; recovery runs only after explicit
+        confirmation and may change local publication state. Push stays
+        disabled. Publication Cancel is offered in the stream editor; pending
+        cancel retries and lock verification are available here.
+      </p>
+      <p className={styles.hint}>
+        The recoverable queue is a separate concept from the latest publication
+        status shown in an individual stream editor.
+      </p>
+
+      {lock.lock && (
+        <output className={styles.lockBanner}>
+          <h2>Recovery lock active</h2>
+          <p>
+            {lock.lock.affected.length} tracked stream identity/identities.
+            {publishBannerText(lock.lock)}
+          </p>
+          <button
+            type="button"
+            onClick={() => void verifyUnlock()}
+            disabled={
+              queueQuery.isFetching ||
+              unlockInFlight ||
+              retryInFlight ||
+              recoveryMutation.isPending ||
+              lock.lock?.stage === "running"
+            }
+          >
+            Re-read authoritative state
+          </button>
+        </output>
+      )}
+      {verificationError && (
+        <p ref={verificationErrorRef} className={styles.fieldError} role="alert">
+          {verificationError}
+        </p>
+      )}
+      {verificationMessage && <output>{verificationMessage}</output>}
+      {retryMessage && <output>{retryMessage}</output>}
+      {retryError && (
+        <p className={styles.fieldError} role="alert">
+          {retryError}
+        </p>
+      )}
+      {lock.invalid && (
+        <div className={styles.lockBanner} role="alert">
+          <h2>Recovery lock state unavailable</h2>
+          <p>
+            The persisted lock is malformed. Consequential actions are blocked;
+            no force-clear is offered.
+          </p>
+        </div>
+      )}
+
+      {actionError && (
+        <p ref={actionErrorRef} className={styles.fieldError} role="alert">
+          {actionError}
+        </p>
+      )}
+
+      {(!locked || recoveryReady) && !confirming && (
+        <div className={styles.inlineActions}>
+          <button
+            type="button"
+            onClick={() => setConfirming(true)}
+            disabled={mutationDisabled}
+          >
+            Run recovery
+          </button>
+          {parsedQueue === null && queueQuery.isSuccess && (
+            <p className={styles.fieldError}>
+              A valid queue snapshot is required before recovery can start.
+            </p>
+          )}
+        </div>
+      )}
+      {(!locked || recoveryReady) && confirming && (
+        <fieldset className={styles.confirm}>
+          <legend>Confirm recovery pass</legend>
+          <p>
+            Run one bounded recovery pass? It reads Keitaro but may durably
+            change local publication state. No automatic retry or live write is
+            performed.
+          </p>
+          <button type="button" onClick={() => void confirmRecovery()}>
+            Confirm recovery
+          </button>
+          <button type="button" onClick={() => setConfirming(false)}>
+            Keep queue unchanged
+          </button>
+        </fieldset>
+      )}
+
+      {retryReady && (
+        <fieldset className={styles.confirm}>
+          <legend>Confirm cancel retry</legend>
+          <p>
+            Fresh authoritative reads show the publication is still pending.
+            Send one more local Cancel under the existing lock? No automatic
+            retry and no Keitaro request are performed.
+          </p>
+          <button
+            type="button"
+            onClick={() => void retryCancel()}
+            disabled={retryInFlight || queueQuery.isFetching}
+          >
+            Confirm cancel retry
+          </button>
+        </fieldset>
+      )}
+
+      {recoveryMutation.isPending && (
+        <output>Recovery pass is running. Duplicate submissions are disabled.</output>
+      )}
+      {run?.phaseUpdated === false && (
+        <p className={styles.fieldError} role="alert">
+          The recovery phase transition could not be persisted. The lock
+          remains active in running phase and unlock is blocked.
+        </p>
+      )}
+      {run?.unionUpdated === false && (
+        <p className={styles.fieldError} role="alert">
+          The affected identity union could not be persisted. The lock remains
+          active and unlock is blocked.
+        </p>
+      )}
+      {run?.failure && (
+        <div className={styles.errorPanel} role="alert">
+          <h2>Recovery outcome unknown or incomplete</h2>
+          <p>{run.failure.message}</p>
+          {run.failure.code && (
+            <p className={styles.hint}>API error code: {run.failure.code}</p>
+          )}
+          {run.failure.result && (
+            <RecoveryResultSummary result={run.failure.result} degraded />
+          )}
+        </div>
+      )}
+      {run?.result && <RecoveryResultSummary result={run.result} degraded={false} />}
+
+      {queueQuery.isPending && <output>Loading recoverable publications…</output>}
+      {queueQuery.isError && (() => {
+        const failure = describeFailure(queueQuery.error);
+        return (
+          <PublicationReadError
+            heading="Recoverable publications unavailable"
+            message={failure.message}
+            code={failure.code}
+            retryLabel="Retry queue read"
+            onRetry={() => queueQuery.refetch()}
+            retryDisabled={queueQuery.isFetching}
+          />
+        );
+      })()}
+      {queueInvalid && (
+        <PublicationReadError
+          heading="Recoverable publications unavailable"
+          message="The bounded queue response was malformed."
+          code={null}
+          retryLabel="Retry queue read"
+          onRetry={() => queueQuery.refetch()}
+          retryDisabled={queueQuery.isFetching}
+        />
+      )}
+
+      {parsedQueue !== null && (
+        <>
+          <div
+            className={`${styles.completeness} ${potentiallyTruncated ? styles.truncated : ""}`}
+          >
+            {potentiallyTruncated ? (
+              <p>
+                Potentially truncated: the API returns at most{" "}
+                {RECOVERABLE_PUBLICATIONS_LIMIT} records. An operation absent
+                from this response is not proven resolved.
+              </p>
+            ) : (
+              <p>
+                Complete for this read: fewer than{" "}
+                {RECOVERABLE_PUBLICATIONS_LIMIT} unresolved records were
+                returned. This is still a point-in-time snapshot; state may
+                change concurrently.
+              </p>
+            )}
+          </div>
+          {operations.length === 0 ? (
+            <p className={styles.empty}>
+              {"No unresolved operations were returned in this bounded view. This does not prove global or permanent resolution."}
+            </p>
+          ) : (
+            <ul aria-label="Recoverable publication operations" className={styles.operationList}>
+              {operations.map((operation) => (
+                <PublicationOperationCard
+                  key={operation.operation_uuid}
+                  operation={operation}
+                />
+              ))}
+            </ul>
+          )}
+          <p className={styles.hint}>
+            This screen never claims global recovery completion. Current state
+            must be re-read before any later operator action.
+          </p>
+        </>
+      )}
+
+      <p>
+        <Link to="/campaigns/open">Open a campaign</Link>
+      </p>
+    </section>
+  );
+}

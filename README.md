@@ -1,11 +1,72 @@
-<div align="center">
+# Keitaro Wrap
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+FastAPI + SQLAlchemy application with the Slice 0–7 workflows and HTTP API.
 
-  <h1>Built with AI Studio</h2>
+## Setup
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+1. Install [uv](https://docs.astral.sh/uv/).
+2. Sync the project and development tools:
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+   ```bash
+   uv sync
+   ```
 
-</div>
+   This creates/uses `.venv` and installs the locked dependencies from `uv.lock`.
+3. Copy env: `cp .env.example .env` and set `KEITARO_API_KEY`. Slice 6 live publication writes stay disabled unless `KEITARO_ALLOW_PUBLICATION_WRITES=true` is set **after** live verification that offers-only PUT preserves non-offer stream fields.
+4. Run migrations: `uv run alembic upgrade head`
+5. Start app: `uv run uvicorn app.main:app --reload`
+
+`requirements.txt` is a compatibility shim for pip users and installs the runtime package only
+(`pip install -r requirements.txt`); development tools are installed with `uv sync`.
+uv is the canonical workflow.
+
+## Lockfile policy
+
+- `uv.lock` is committed and CI uses `uv sync --locked`.
+- Update dependencies with `uv add`/`uv remove` or `uv lock --upgrade`, then commit `pyproject.toml` and `uv.lock` together.
+- Do not edit `uv.lock` by hand.
+
+## Checks
+
+Run the full local verification suite:
+
+```bash
+make check
+```
+
+Individual targets:
+
+- `make format` — format code with Ruff.
+- `make format-check` — verify formatting without modifying files.
+- `make lint` — run Ruff checks.
+- `make type-check` — run Pyrefly.
+- `make pytest` — run the test suite.
+- `make coverage` — run tests with coverage (source: `app`, fail-under: 64%).
+- `make coverage-html` — write an HTML coverage report to `htmlcov/`.
+- `make doc-coverage` — run docstring coverage (source: `app`, fail-under: 100%).
+- `make all-checks` — alias for `make check`.
+
+## Interpreting results
+
+- **Coverage**: measured against the `app` package with branch coverage. The initial gate is 64%, matching the current measured baseline. New code should not reduce coverage below this threshold; raise the threshold as coverage improves.
+- **Docstring coverage**: measured against maintained application code in `app/` (init modules and generated/migration files are excluded). The initial gate is 100%.
+- **Type checking**: Pyrefly checks `app/` and `tests/` with no baseline file; any new type error fails the gate.
+- **Formatting**: CI runs `ruff format --check` and fails if files would be reformatted.
+
+## Tests
+
+```bash
+uv run pytest -q
+```
+
+## Health
+
+GET /health -> {"status": "ok"}
+
+## HTTP API
+
+The Slice 7 routes expose campaign creation/read/resume, Fetch, cached stream and
+committed/draft/publication reads, local draft commands, Push, publication Cancel
+and recovery. Route contracts and error codes are tracked in issue #35 and
+`docs/architecture.md`; request/response schemas live in `app/api/schemas.py`.
+Live publication writes remain disabled by default.
